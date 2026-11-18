@@ -1,0 +1,24 @@
+# Build output
+build/
+build-*/
+dist/
+*.zip
+
+# macOS
+.DS_Store
+._*
+*.log
+
+# Local cloud/test folders
+FakeCloud/
+FakeOneDrive/
+demo-support/
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+DerivedData/
+
+# Swift Package Manager
+.build/
+.swiftpm/
