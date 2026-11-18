@@ -9,7 +9,7 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Run tests
         run: ./Tests/run.sh
@@ -18,7 +18,7 @@ jobs:
         run: ./build.sh
 
       - name: Upload app
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: Backuper-app
           path: build/Backuper.zip
