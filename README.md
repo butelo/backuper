@@ -119,15 +119,16 @@ the contents.
 - Zips are snapshots taken at drop time. They are not re-created by the daily
   check; drop the item again to make a fresh snapshot. Existing zips are never
   overwritten — a ` 2`, ` 3`… suffix is added.
-- Files larger than 64 MB are stored without compression; everything else is
-  deflated. Symlinks are followed, empty folders are preserved, and the usual
-  junk files (`.DS_Store`, Office lock files, `_Backuper`) are skipped.
+- Files larger than 64 MB are stored without compression; smaller files are
+  deflated when that makes them smaller. Symlinks are followed, empty folders are
+  preserved, and the usual junk files (`.DS_Store`, Office lock files,
+  `_Backuper`) are skipped.
 - Archives keep the dropped name (`Project Alpha.zip`), or use a timestamped
-  `Protected Backup …zip` name when several items are dropped together.
+  `Protected Backup <date>.zip` name when several items are dropped together.
 
-> **Security note:** macOS's built-in Archive Utility and `unzip` only understand
-> the legacy ZIP 2.0 (ZipCrypto) password scheme, and that is what Backuper
-> writes. It keeps casual snooping out but is not modern encryption. Use a long,
+> **Security note:** For compatibility with macOS's built-in Archive Utility and
+> `unzip`, Backuper writes the legacy ZIP 2.0 (ZipCrypto) password scheme. It keeps
+> casual snooping out but is not modern encryption. Use a long,
 > unique passphrase, and use 7-Zip/Keka (AES-256) instead if you need strong
 > protection. Prefer ASCII characters in ZIP passwords: tools differ in how they
 > encode accented letters, so the same-looking password may not always open the
