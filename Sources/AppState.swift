@@ -32,6 +32,15 @@ final class AppState: ObservableObject {
     @Published var dailyHour: Int = 9
     @Published var dailyMinute: Int = 0
 
+    // MARK: - Password-protected ZIPs
+
+    @Published private(set) var commonZipPassword: String = ""
+    @Published private(set) var specificZipPassword: String = ""
+    @Published private(set) var useCommonPassword: Bool = true
+    @Published private(set) var zipPasswordError: String?
+    @Published private(set) var isCreatingZip: Bool = false
+    @Published private(set) var lastProtectedZipURL: URL?
+
     // MARK: - Wiring
 
     /// Set by AppDelegate to reopen the popover after a modal panel closes.
@@ -42,9 +51,11 @@ final class AppState: ObservableObject {
     private let isPreview: Bool
     private var pendingIDs = Set<UUID>()
     private var pendingDropURLs: [URL] = []
+    private var pendingProtectedDropURLs: [URL] = []
     private let syncQueue = DispatchQueue(label: "com.backuper.sync", qos: .utility)
     private var timer: Timer?
     private var noticeWork: DispatchWorkItem?
+    private var passwordSaveWork: [ZipPasswordAccount: DispatchWorkItem] = [:]
 
     // MARK: - Init
 
@@ -85,6 +96,7 @@ final class AppState: ObservableObject {
             lastSyncAt = now.addingTimeInterval(-5_400)
             archive = items.map { Catalog.record(for: $0) }
             launchAtLogin = false
+            useCommonPassword = true
         } else {
             let config = Storage.loadConfig()
             destinationPath = config.destinationPath
@@ -93,6 +105,8 @@ final class AppState: ObservableObject {
             dailyHour = config.dailyHour
             dailyMinute = config.dailyMinute
             lastSyncAt = config.lastSyncAt
+            useCommonPassword = config.useCommonPassword
+            loadZipPasswords()
 
             if destinationPath.isEmpty, let existing = CloudFolderLocator.findExistingBackupDestination() {
                 destinationPath = existing.path
@@ -136,6 +150,18 @@ final class AppState: ObservableObject {
     var destinationIsCloudFolder: Bool { destinationProviderName != nil }
 
     var canSync: Bool { !items.isEmpty && destinationURL != nil }
+
+    var isBusy: Bool { isSyncing || isCreatingZip }
+
+    var activeZipPassword: String {
+        useCommonPassword ? commonZipPassword : specificZipPassword
+    }
+
+    var hasZipPassword: Bool { !activeZipPassword.isEmpty }
+
+    var canCreateProtectedZip: Bool {
+        destinationURL != nil && hasZipPassword && !isBusy
+    }
 
     var itemCountText: String {
         "\(items.count) item\(items.count == 1 ? "" : "s") tracked"
@@ -210,6 +236,110 @@ final class AppState: ObservableObject {
 
     func resolvedOriginalPath(for record: BackupRecord) -> String {
         record.resolvedOriginalURL().path
+    }
+
+    // MARK: - Protected ZIP passwords
+
+    func setActiveZipPassword(_ value: String) {
+        if useCommonPassword {
+            commonZipPassword = value
+        } else {
+            specificZipPassword = value
+        }
+        zipPasswordError = nil
+        schedulePasswordSave(for: useCommonPassword ? .common : .specific)
+    }
+
+    func setUseCommonPassword(_ enabled: Bool) {
+        guard useCommonPassword != enabled else { return }
+        useCommonPassword = enabled
+        zipPasswordError = nil
+        persist()
+        Log.write("protected ZIP password mode: \(enabled ? "common" : "specific")")
+    }
+
+    func resetActiveZipPassword() {
+        let account: ZipPasswordAccount = useCommonPassword ? .common : .specific
+        if useCommonPassword {
+            commonZipPassword = ""
+        } else {
+            specificZipPassword = ""
+        }
+        passwordSaveWork[account]?.cancel()
+        passwordSaveWork[account] = nil
+        savePassword(for: account)
+        setNotice(.info("The \(useCommonPassword ? "common" : "specific") ZIP password was reset."), autoDismiss: 3)
+    }
+
+    func revealLastProtectedZip() {
+        guard let url = lastProtectedZipURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    private func loadZipPasswords() {
+        for account in ZipPasswordAccount.allCases {
+            switch PasswordStore.load(account) {
+            case .success(let password):
+                setPasswordInMemory(password ?? "", for: account)
+            case .failure(let error):
+                zipPasswordError = "Couldn’t read the saved ZIP password: \(error.localizedDescription)"
+                Log.write("keychain read failed (\(account.rawValue)): \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func setPasswordInMemory(_ value: String, for account: ZipPasswordAccount) {
+        switch account {
+        case .common: commonZipPassword = value
+        case .specific: specificZipPassword = value
+        }
+    }
+
+    private func password(for account: ZipPasswordAccount) -> String {
+        switch account {
+        case .common: return commonZipPassword
+        case .specific: return specificZipPassword
+        }
+    }
+
+    private func schedulePasswordSave(for account: ZipPasswordAccount) {
+        passwordSaveWork[account]?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.passwordSaveWork[account] = nil
+            self.savePassword(for: account)
+        }
+        passwordSaveWork[account] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    private func savePassword(for account: ZipPasswordAccount) {
+        guard !isPreview else { return }
+        let value = password(for: account)
+        let result: Result<Void, Error>
+        if value.isEmpty {
+            result = PasswordStore.delete(account)
+        } else {
+            result = PasswordStore.save(value, account: account)
+        }
+        switch result {
+        case .success:
+            zipPasswordError = nil
+        case .failure(let error):
+            zipPasswordError = "Couldn’t update the Keychain."
+            Log.write("keychain save failed (\(account.rawValue)): \(error.localizedDescription)")
+        }
+    }
+
+    /// Called on quit so a password typed in the last few hundred milliseconds
+    /// is not lost to the debounce.
+    func flushZipPasswords() {
+        guard !isPreview else { return }
+        for account in ZipPasswordAccount.allCases {
+            passwordSaveWork[account]?.cancel()
+            passwordSaveWork[account] = nil
+            savePassword(for: account)
+        }
     }
 
     // MARK: - Adding items
@@ -334,6 +464,138 @@ final class AppState: ObservableObject {
         setNotice(.info("Stopped tracking “\(item.displayName)”. The copy in the cloud folder was left in place."), autoDismiss: 5)
     }
 
+    // MARK: - Password-protected ZIP backups
+
+    func createProtectedZip(urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        guard let root = destinationURL else {
+            pendingProtectedDropURLs = urls
+            setNotice(.info("Choose a folder inside OneDrive, Dropbox, Google Drive, iCloud Drive, or another synced folder."), autoDismiss: 6)
+            chooseDestination()
+            return
+        }
+        guard hasZipPassword else {
+            setNotice(.error("Set a ZIP password first, below the drop areas."), autoDismiss: 7)
+            return
+        }
+        guard !isBusy else {
+            setNotice(.info("Wait for the current backup to finish, then drop again."), autoDismiss: 5)
+            return
+        }
+
+        let fm = FileManager.default
+        let rootPath = root.standardizedFileURL.path
+        var accepted: [URL] = []
+        var seen = Set<String>()
+        var insideRootCount = 0
+        var containsRootCount = 0
+        var reservedCount = 0
+        var missingCount = 0
+
+        for rawURL in urls {
+            let url = rawURL.standardizedFileURL
+            guard seen.insert(url.path).inserted else { continue }
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: url.path, isDirectory: &isDir) else {
+                missingCount += 1
+                continue
+            }
+            if url.path == rootPath || url.path.hasPrefix(rootPath + "/") {
+                insideRootCount += 1
+                continue
+            }
+            if isDir.boolValue && rootPath.hasPrefix(url.path + "/") {
+                containsRootCount += 1
+                continue
+            }
+            if Catalog.isReservedName(url.lastPathComponent) {
+                reservedCount += 1
+                continue
+            }
+            accepted.append(url)
+        }
+
+        guard !accepted.isEmpty else {
+            if insideRootCount > 0 {
+                setNotice(.error("That item is already inside the backup folder."))
+            } else if containsRootCount > 0 {
+                setNotice(.error("That folder contains the backup folder. Pick another folder."))
+            } else if reservedCount > 0 {
+                setNotice(.error("“\(Catalog.folderName)” is reserved for Backuper’s metadata."))
+            } else if missingCount > 0 {
+                setNotice(.error("Those items no longer exist."))
+            } else {
+                setNotice(.error("Nothing was added. Drop a file or folder from Finder."))
+            }
+            return
+        }
+
+        // Make sure the typed password is durable before it is used.
+        savePassword(for: useCommonPassword ? .common : .specific)
+        let password = activeZipPassword
+        let account = useCommonPassword ? "common" : "specific"
+        isCreatingZip = true
+        activity = accepted.count == 1
+            ? "Creating protected ZIP for “\(accepted[0].lastPathComponent)”…"
+            : "Creating protected ZIP for \(accepted.count) items…"
+        Log.write("zip start: \(accepted.count) source(s), \(account) password -> \(root.path)")
+
+        syncQueue.async { [weak self] in
+            guard let self else { return }
+            do {
+                let summary = try ZipEngine.createProtectedZip(sources: accepted,
+                                                               destinationRoot: root,
+                                                               password: password) { note in
+                    DispatchQueue.main.async {
+                        self.activity = note
+                    }
+                }
+                DispatchQueue.main.async {
+                    self.finishProtectedZip(summary)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.finishProtectedZip(error: error)
+                }
+            }
+        }
+    }
+
+    private func finishProtectedZip(_ summary: ProtectedZipSummary) {
+        isCreatingZip = false
+        activity = nil
+        lastProtectedZipURL = summary.archiveURL
+        let name = summary.archiveURL.lastPathComponent
+
+        if summary.errors.isEmpty {
+            let contents: String
+            if summary.fileCount == 0, summary.directoryCount > 0 {
+                contents = "\(summary.directoryCount) folder\(summary.directoryCount == 1 ? "" : "s")"
+            } else {
+                let files = "\(summary.fileCount) file\(summary.fileCount == 1 ? "" : "s")"
+                let size = summary.byteCount > 0 ? " · \(Format.bytes(summary.byteCount))" : ""
+                contents = files + size
+            }
+            setNotice(.success("Protected ZIP “\(name)” saved with \(contents)"), autoDismiss: 6)
+        } else {
+            let extra = summary.errors[0]
+            setNotice(.error("Protected ZIP saved with problems: \(summary.skippedCount) item\(summary.skippedCount == 1 ? "" : "s") skipped — \(extra)"), autoDismiss: 10)
+        }
+        Log.write("zip finish: \(name), files=\(summary.fileCount), bytes=\(summary.byteCount), skipped=\(summary.skippedCount)")
+        reopenPopover?()
+        if !pendingIDs.isEmpty {
+            runSync()
+        }
+    }
+
+    private func finishProtectedZip(error: Error) {
+        isCreatingZip = false
+        activity = nil
+        setNotice(.error("Couldn’t create the protected ZIP: \(error.localizedDescription)"), autoDismiss: 10)
+        Log.write("zip failed: \(error.localizedDescription)")
+        reopenPopover?()
+    }
+
     // MARK: - Destination
 
     func chooseDestination() {
@@ -361,8 +623,14 @@ final class AppState: ObservableObject {
                     self.pendingDropURLs = []
                     self.add(urls: urls)
                 }
+                if !self.pendingProtectedDropURLs.isEmpty {
+                    let urls = self.pendingProtectedDropURLs
+                    self.pendingProtectedDropURLs = []
+                    self.createProtectedZip(urls: urls)
+                }
             } else {
                 self.pendingDropURLs = []
+                self.pendingProtectedDropURLs = []
             }
         }
         panel.begin(completionHandler: handler)
@@ -373,6 +641,7 @@ final class AppState: ObservableObject {
         guard path != destinationPath else { return }
         destinationPath = path
         archive = []
+        lastProtectedZipURL = nil
         persist()
         reloadArchive()
         Log.write("destination set to \(path)")
@@ -443,7 +712,7 @@ final class AppState: ObservableObject {
 
     private func runSync() {
         guard !isPreview else { return }
-        guard !isSyncing else { return }
+        guard !isSyncing, !isCreatingZip else { return }
         guard let root = destinationURL else {
             chooseDestination()
             return
@@ -722,7 +991,7 @@ final class AppState: ObservableObject {
 
     // MARK: - Drag & drop
 
-    func handleDrop(providers: [NSItemProvider]) {
+    func handleDrop(providers: [NSItemProvider], protected: Bool = false) {
         let group = DispatchGroup()
         let lock = NSLock()
         var urls: [URL] = []
@@ -754,7 +1023,11 @@ final class AppState: ObservableObject {
             guard let self else { return }
             var seen = Set<String>()
             let unique = urls.filter { seen.insert($0.standardizedFileURL.path).inserted }
-            self.add(urls: unique)
+            if protected {
+                self.createProtectedZip(urls: unique)
+            } else {
+                self.add(urls: unique)
+            }
         }
     }
 
@@ -767,7 +1040,8 @@ final class AppState: ObservableObject {
                                       dailyHour: dailyHour,
                                       dailyMinute: dailyMinute,
                                       items: items,
-                                      lastSyncAt: lastSyncAt)
+                                      lastSyncAt: lastSyncAt,
+                                      useCommonPassword: useCommonPassword)
         Storage.saveConfig(config)
     }
 

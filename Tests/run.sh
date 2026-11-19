@@ -14,6 +14,7 @@ swiftc -swift-version 5 -target "$ARCH-apple-macos13.0" \
     Sources/Catalog.swift \
     Sources/CloudFolderLocator.swift \
     Sources/SyncEngine.swift \
+    Sources/ZipEngine.swift \
     Sources/RestoreEngine.swift \
     Tests/main.swift \
     -o build/BackuperTests

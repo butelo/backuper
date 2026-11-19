@@ -18,8 +18,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state.openRestoreWindow = { [weak self] in self?.showRestoreWindow() }
 
         state.$isSyncing
+            .combineLatest(state.$isCreatingZip)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] syncing in self?.updateStatusIcon(syncing: syncing) }
+            .sink { [weak self] syncing, zipping in self?.updateStatusIcon(busy: syncing || zipping) }
             .store(in: &cancellables)
 
         if !UserDefaults.standard.bool(forKey: "hasLaunchedBefore") {
@@ -36,6 +37,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        state.flushZipPasswords()
     }
 
     // MARK: - Status item
@@ -59,12 +64,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return image
     }
 
-    private func updateStatusIcon(syncing: Bool) {
-        let image = syncing
-            ? symbolImage("arrow.triangle.2.circlepath", description: "Backuper is syncing")
+    private func updateStatusIcon(busy: Bool) {
+        let image = busy
+            ? symbolImage("arrow.triangle.2.circlepath", description: "Backuper is working")
             : symbolImage("icloud.and.arrow.up")
         statusItem.button?.image = image
-        statusItem.button?.toolTip = syncing ? "Backuper is backing up…" : "Backuper — click to back up to the cloud"
+        statusItem.button?.toolTip = busy ? "Backuper is working…" : "Backuper — click to back up to the cloud"
     }
 
     @objc private func statusItemClicked() {

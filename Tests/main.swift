@@ -38,6 +38,25 @@ func read(_ url: URL) -> String? {
     return String(data: data, encoding: .utf8)
 }
 
+@discardableResult
+func run(_ tool: String, _ arguments: [String], cwd: URL? = nil) -> (status: Int32, output: String) {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: tool)
+    process.arguments = arguments
+    if let cwd { process.currentDirectoryURL = cwd }
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = pipe
+    do {
+        try process.run()
+    } catch {
+        return (-1, error.localizedDescription)
+    }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+}
+
 // MARK: - Fixtures
 
 let project = sourceRoot.appendingPathComponent("Project Alpha", isDirectory: true)
@@ -264,6 +283,175 @@ check(CloudFolderLocator.providerName(for: home.appendingPathComponent("Download
       "does not mislabel ordinary folders")
 check(CloudFolderLocator.findExistingBackupDestination(in: [home.appendingPathComponent("MissingCloudRoot")]) == nil,
       "ignores cloud roots that do not exist")
+
+// MARK: - 13. Password-protected ZIP backups
+
+print("\n13. Password-protected ZIP backups")
+let zipSource = root.appendingPathComponent("ZipSource", isDirectory: true)
+let zipDocs = zipSource.appendingPathComponent("docs", isDirectory: true)
+let zipEmpty = zipSource.appendingPathComponent("empty folder", isDirectory: true)
+try! fm.createDirectory(at: zipDocs, withIntermediateDirectories: true)
+try! fm.createDirectory(at: zipEmpty, withIntermediateDirectories: true)
+write("zip secret plan\n", to: zipSource.appendingPathComponent("plan.txt"))
+write("zip notes\n", to: zipDocs.appendingPathComponent("notes.md"))
+write("unicode notes\n", to: zipDocs.appendingPathComponent("café.txt"))
+write("junk", to: zipSource.appendingPathComponent(".DS_Store"))
+let looseZipFile = root.appendingPathComponent("loose.pdf")
+write("loose file data\n", to: looseZipFile)
+
+let linkURL = zipSource.appendingPathComponent("link-to-plan.txt")
+try? fm.removeItem(at: linkURL)
+try? fm.createSymbolicLink(atPath: linkURL.path, withDestinationPath: "plan.txt")
+
+let zipPassword = "correct horse battery staple"
+let zipDate = Date(timeIntervalSince1970: 1_700_000_000)
+let singleZip = try! ZipEngine.createProtectedZip(sources: [zipSource],
+                                                 destinationRoot: fakeCloud,
+                                                 password: zipPassword,
+                                                 now: zipDate)
+check(singleZip.archiveURL.lastPathComponent == "ZipSource.zip",
+      "single source ZIP uses the source name (got \(singleZip.archiveURL.lastPathComponent))")
+check(singleZip.archiveURL.deletingLastPathComponent().lastPathComponent == ZipEngine.folderName,
+      "ZIP lands in the Protected Zips folder")
+let singleFileZip = try! ZipEngine.createProtectedZip(sources: [looseZipFile],
+                                                     destinationRoot: fakeCloud,
+                                                     password: zipPassword,
+                                                     now: zipDate)
+check(singleFileZip.archiveURL.lastPathComponent == "loose.pdf.zip",
+      "single-file ZIP keeps the original extension (got \(singleFileZip.archiveURL.lastPathComponent))")
+check(singleZip.fileCount == 4, "ZIP contains 4 files (got \(singleZip.fileCount))")
+check(singleZip.directoryCount == 3, "ZIP contains 3 folder entries (got \(singleZip.directoryCount))")
+check(fm.fileExists(atPath: singleZip.archiveURL.path), "ZIP file exists")
+let zipPermissions = (try? fm.attributesOfItem(atPath: singleZip.archiveURL.path)[.posixPermissions] as? NSNumber)?.intValue
+check(zipPermissions == 0o600, "ZIP file is user-only (got \(zipPermissions.map(String.init) ?? "nil"))")
+
+let zipTest = run("/usr/bin/unzip", ["-P", zipPassword, "-t", singleZip.archiveURL.path])
+check(zipTest.status == 0, "unzip accepts the password and the archive integrity (\(zipTest.output.trimmingCharacters(in: .whitespacesAndNewlines)))")
+let wrongPassword = run("/usr/bin/unzip", ["-P", "not the password", "-t", singleZip.archiveURL.path])
+check(wrongPassword.status != 0, "a wrong password is rejected")
+
+let zipExtract = root.appendingPathComponent("ZipExtract", isDirectory: true)
+try? fm.removeItem(at: zipExtract)
+try! fm.createDirectory(at: zipExtract, withIntermediateDirectories: true)
+let extract = run("/usr/bin/unzip", ["-q", "-o", "-P", zipPassword, singleZip.archiveURL.path, "-d", zipExtract.path])
+check(extract.status == 0, "the archive extracts (\(extract.output.trimmingCharacters(in: .whitespacesAndNewlines)))")
+let extractedRoot = zipExtract.appendingPathComponent("ZipSource")
+check(read(extractedRoot.appendingPathComponent("plan.txt")) == "zip secret plan\n", "extracted file content matches")
+check(read(extractedRoot.appendingPathComponent("docs/café.txt")) == "unicode notes\n", "unicode file names survive")
+check(fm.fileExists(atPath: extractedRoot.appendingPathComponent("empty folder").path), "empty folders survive")
+check(read(extractedRoot.appendingPathComponent("link-to-plan.txt")) == "zip secret plan\n", "symlinks are followed like zip(1)")
+check(!fm.fileExists(atPath: extractedRoot.appendingPathComponent(".DS_Store").path), "junk files are skipped")
+let archiveBytes = try! Data(contentsOf: singleZip.archiveURL)
+check(archiveBytes.range(of: Data("zip secret plan".utf8)) == nil, "file contents are not stored in plaintext")
+
+let libarchiveRead = run("/usr/bin/bsdtar", ["--passphrase", zipPassword, "-xOf", singleZip.archiveURL.path, "ZipSource/plan.txt"])
+check(libarchiveRead.status == 0 && libarchiveRead.output == "zip secret plan\n",
+      "libarchive (bsdtar) can decrypt the archive too")
+let libarchiveWrong = run("/usr/bin/bsdtar", ["--passphrase", "wrong", "-xOf", singleZip.archiveURL.path, "ZipSource/plan.txt"])
+check(libarchiveWrong.status != 0, "libarchive rejects a wrong password")
+
+let compressible = root.appendingPathComponent("ZipCompressible.txt")
+let compressibleText = String(repeating: "0123456789abcdef\n", count: 50_000)
+write(compressibleText, to: compressible)
+let compressedArchive = root.appendingPathComponent("ZipCompressed/compressed.zip")
+_ = try! ZipEngine.createArchive(at: compressedArchive, sources: [compressible], password: zipPassword)
+let compressedSize = (try! fm.attributesOfItem(atPath: compressedArchive.path)[.size] as! NSNumber).int64Value
+check(compressedSize < 200_000, "compressible files are deflated (got \(compressedSize) bytes)")
+let compressedText = run("/usr/bin/unzip", ["-p", "-P", zipPassword, compressedArchive.path, "ZipCompressible.txt"])
+check(compressedText.status == 0 && compressedText.output == compressibleText,
+      "deflated content round-trips")
+let zipInfo = run("/usr/bin/zipinfo", ["-v", compressedArchive.path])
+check(zipInfo.output.contains("deflated"), "the archive records deflate as the compression method")
+
+let multiZip = try! ZipEngine.createProtectedZip(sources: [zipSource, looseZipFile],
+                                                 destinationRoot: fakeCloud,
+                                                 password: zipPassword,
+                                                 now: zipDate)
+check(multiZip.archiveURL.lastPathComponent.hasPrefix("Protected Backup "),
+      "multiple sources get a dated archive name")
+check(multiZip.fileCount == 5, "multiple-source ZIP contains 5 files (got \(multiZip.fileCount))")
+check(run("/usr/bin/unzip", ["-P", zipPassword, "-t", multiZip.archiveURL.path]).status == 0,
+      "multiple-source ZIP is valid")
+
+let secondSingleZip = try! ZipEngine.createProtectedZip(sources: [zipSource],
+                                                        destinationRoot: fakeCloud,
+                                                        password: zipPassword,
+                                                        now: zipDate)
+check(secondSingleZip.archiveURL.lastPathComponent == "ZipSource 2.zip",
+      "existing archive names are not overwritten (got \(secondSingleZip.archiveURL.lastPathComponent))")
+
+var emptyPasswordRejected = false
+do {
+    _ = try ZipEngine.createProtectedZip(sources: [looseZipFile],
+                                         destinationRoot: fakeCloud,
+                                         password: "")
+} catch {
+    emptyPasswordRejected = true
+}
+check(emptyPasswordRejected, "an empty password is rejected")
+
+let zip64URL = root.appendingPathComponent("Zip64/forced.zip")
+try? fm.removeItem(at: zip64URL.deletingLastPathComponent())
+let zip64 = try! ZipEngine.createArchive(at: zip64URL,
+                                         sources: [looseZipFile],
+                                         password: zipPassword,
+                                         options: ZipEngineOptions(forceZip64: true))
+check(zip64.fileCount == 1, "ZIP64 test archive has its file")
+let zip64Test = run("/usr/bin/unzip", ["-P", zipPassword, "-t", zip64URL.path])
+check(zip64Test.status == 0, "ZIP64 local headers stay readable (\(zip64Test.output.trimmingCharacters(in: .whitespacesAndNewlines)))")
+
+let emptyFile = root.appendingPathComponent("ZipEdge/empty.txt")
+write("", to: emptyFile)
+let emptyDir = root.appendingPathComponent("ZipEdge/empty-dir", isDirectory: true)
+try! fm.createDirectory(at: emptyDir, withIntermediateDirectories: true)
+let edgeArchive = root.appendingPathComponent("ZipEdge/edge.zip")
+let edgeSummary = try! ZipEngine.createArchive(at: edgeArchive,
+                                               sources: [emptyFile, emptyDir],
+                                               password: zipPassword)
+check(edgeSummary.fileCount == 1 && edgeSummary.directoryCount == 1, "empty files and folders are archived")
+check(run("/usr/bin/unzip", ["-P", zipPassword, "-t", edgeArchive.path]).status == 0,
+      "an archive with an empty file is valid")
+let edgeExtract = root.appendingPathComponent("ZipEdge/extracted", isDirectory: true)
+_ = run("/usr/bin/unzip", ["-q", "-o", "-P", zipPassword, edgeArchive.path, "-d", edgeExtract.path])
+check(fm.fileExists(atPath: edgeExtract.appendingPathComponent("empty.txt").path),
+      "the empty file extracts")
+check(fm.fileExists(atPath: edgeExtract.appendingPathComponent("empty-dir").path),
+      "the empty folder extracts")
+
+let nameA = root.appendingPathComponent("ZipNames/A", isDirectory: true)
+let nameB = root.appendingPathComponent("ZipNames/B", isDirectory: true)
+write("from A\n", to: nameA.appendingPathComponent("same.txt"))
+write("from B\n", to: nameB.appendingPathComponent("same.txt"))
+let collisionArchive = root.appendingPathComponent("ZipNames/collision.zip")
+_ = try! ZipEngine.createArchive(at: collisionArchive,
+                                 sources: [nameA.appendingPathComponent("same.txt"),
+                                           nameB.appendingPathComponent("same.txt")],
+                                 password: zipPassword)
+let collisionExtract = root.appendingPathComponent("ZipNames/extracted", isDirectory: true)
+_ = run("/usr/bin/unzip", ["-q", "-o", "-P", zipPassword, collisionArchive.path, "-d", collisionExtract.path])
+check(read(collisionExtract.appendingPathComponent("same.txt")) == "from A\n",
+      "duplicate top-level names keep the first file")
+check(read(collisionExtract.appendingPathComponent("same 2.txt")) == "from B\n",
+      "duplicate top-level names get a suffix before the extension")
+
+let unicodePassword = "密码 with spaces ✓"
+let unicodePasswordArchive = root.appendingPathComponent("ZipEdge/unicode-password.zip")
+_ = try! ZipEngine.createArchive(at: unicodePasswordArchive, sources: [looseZipFile], password: unicodePassword)
+let unicodePasswordTest = run("/usr/bin/unzip", ["-P", unicodePassword, "-t", unicodePasswordArchive.path])
+check(unicodePasswordTest.status == 0, "unicode passwords work with unzip")
+
+// MARK: - 14. Older config files still load
+
+print("\n14. Older configurations still load")
+let legacyConfig = """
+{"destinationPath":"/tmp/legacy","dailyEnabled":true,"dailyHour":9,"dailyMinute":0,"items":[]}
+"""
+let decodedLegacy = try! JSONDecoder().decode(AppConfiguration.self, from: Data(legacyConfig.utf8))
+check(decodedLegacy.useCommonPassword, "configs from before this feature default to the common password")
+var roundTripConfig = AppConfiguration()
+roundTripConfig.useCommonPassword = false
+let roundTripped = try! JSONDecoder().decode(AppConfiguration.self, from: JSONEncoder().encode(roundTripConfig))
+check(roundTripped.useCommonPassword == false, "the password mode round-trips through config.json")
 
 // MARK: - Summary
 

@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 
 final class PopoverViewState: ObservableObject {
     @Published var isTargeted = false
+    @Published var isZipTargeted = false
 }
 
 struct PopoverView: View {
@@ -11,6 +12,7 @@ struct PopoverView: View {
     @ObservedObject var viewState: PopoverViewState
 
     private var isTargeted: Bool { viewState.isTargeted }
+    private var isZipTargeted: Bool { viewState.isZipTargeted }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -19,8 +21,9 @@ struct PopoverView: View {
             ScrollView(.vertical, showsIndicators: true) {
                 VStack(alignment: .leading, spacing: 12) {
                     destinationCard
-                    dropZone
-                    if state.isSyncing {
+                    dropZones
+                    passwordCard
+                    if state.isBusy {
                         syncingRow
                     }
                     if let notice = state.notice {
@@ -36,10 +39,6 @@ struct PopoverView: View {
         }
         .frame(width: 400, height: 580)
         .background(Color(nsColor: .windowBackgroundColor))
-        .onDrop(of: [UTType.fileURL.identifier], isTargeted: $viewState.isTargeted) { providers in
-            state.handleDrop(providers: providers)
-            return true
-        }
     }
 
     // MARK: - Header
@@ -138,28 +137,142 @@ struct PopoverView: View {
         .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.primary.opacity(0.05)))
     }
 
-    // MARK: - Drop zone
+    // MARK: - Drop zones
 
-    private var dropZone: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(isTargeted ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.02))
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .strokeBorder(isTargeted ? Color.accentColor : Color.secondary.opacity(0.40),
-                              style: StrokeStyle(lineWidth: 1.5, dash: isTargeted ? [] : [6, 4]))
-            VStack(spacing: 5) {
-                Image(systemName: isTargeted ? "arrow.down.doc.fill" : "arrow.down.doc")
-                    .font(.system(size: 21))
-                    .foregroundColor(isTargeted ? .accentColor : .secondary)
-                Text(isTargeted ? "Drop to back up" : "Drag files or folders here")
-                    .font(.system(size: 12.5, weight: .medium))
-                Text("Copied into your cloud folder")
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary)
+    private var dropZones: some View {
+        HStack(alignment: .top, spacing: 10) {
+            dropZone(title: isTargeted ? "Drop to back up" : "Back up",
+                     subtitle: "Copy to cloud folder",
+                     icon: isTargeted ? "arrow.down.doc.fill" : "arrow.down.doc",
+                     targeted: $viewState.isTargeted,
+                     help: "Drop files or folders to copy them into the cloud folder.") { providers in
+                state.handleDrop(providers: providers, protected: false)
+            }
+            dropZone(title: isZipTargeted ? "Drop to protect" : "Protected ZIP",
+                     subtitle: state.hasZipPassword ? "Encrypted .zip backup" : "Set a password below",
+                     icon: isZipTargeted ? "lock.doc.fill" : "lock.doc",
+                     targeted: $viewState.isZipTargeted,
+                     help: "Drop files or folders to create a password-protected ZIP in the cloud folder.") { providers in
+                state.handleDrop(providers: providers, protected: true)
             }
         }
-        .frame(height: 100)
-        .animation(.easeOut(duration: 0.15), value: isTargeted)
+    }
+
+    private func dropZone(title: String,
+                          subtitle: String,
+                          icon: String,
+                          targeted: Binding<Bool>,
+                          help: String,
+                          onDrop: @escaping ([NSItemProvider]) -> Void) -> some View {
+        let active = targeted.wrappedValue
+        return ZStack {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(active ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.02))
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(active ? Color.accentColor : Color.secondary.opacity(0.40),
+                              style: StrokeStyle(lineWidth: 1.5, dash: active ? [] : [6, 4]))
+            VStack(spacing: 5) {
+                Image(systemName: icon)
+                    .font(.system(size: 21))
+                    .foregroundColor(active ? .accentColor : .secondary)
+                Text(title)
+                    .font(.system(size: 12, weight: .medium))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                Text(subtitle)
+                    .font(.system(size: 9.5))
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+            }
+            .padding(.horizontal, 6)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 104)
+        .contentShape(Rectangle())
+        .onDrop(of: [UTType.fileURL.identifier], isTargeted: targeted) { providers in
+            onDrop(providers)
+            return true
+        }
+        .animation(.easeOut(duration: 0.15), value: active)
+        .help(help)
+    }
+
+    // MARK: - Password
+
+    private var passwordCard: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 6) {
+                Toggle(isOn: Binding(get: { state.useCommonPassword },
+                                     set: { state.setUseCommonPassword($0) })) {
+                    Text("Use a common password")
+                        .font(.system(size: 11))
+                }
+                .toggleStyle(.checkbox)
+                .help("Checked: one common password for every protected ZIP. Unchecked: a separate, specific password. Each mode remembers its own password.")
+
+                Spacer(minLength: 4)
+
+                if state.hasZipPassword {
+                    Label("Set", systemImage: "checkmark.seal.fill")
+                        .font(.system(size: 9.5))
+                        .foregroundColor(.green)
+                } else {
+                    Label("Not set", systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 9.5))
+                        .foregroundColor(.orange)
+                }
+            }
+
+            HStack(spacing: 6) {
+                Image(systemName: "lock")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+                SecureField(state.useCommonPassword ? "Common ZIP password" : "Specific ZIP password",
+                            text: Binding(get: { state.activeZipPassword },
+                                          set: { state.setActiveZipPassword($0) }))
+                    .textFieldStyle(.roundedBorder)
+                    .controlSize(.small)
+                    .font(.system(size: 11))
+                    .help("Held in your Keychain until you press Reset. Existing ZIPs keep the password they were created with. ZIP 2.0 encryption: use a long passphrase.")
+                Button("Reset") { state.resetActiveZipPassword() }
+                    .controlSize(.small)
+                    .disabled(!state.hasZipPassword)
+                    .help("Forget the \(state.useCommonPassword ? "common" : "specific") password")
+            }
+
+            HStack(spacing: 4) {
+                Text(state.useCommonPassword
+                     ? "Saved in your Keychain and reused for every protected ZIP until reset."
+                     : "A separate password for protected ZIPs, saved in your Keychain until reset.")
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 4)
+                if state.lastProtectedZipURL != nil {
+                    Button("Show last ZIP") { state.revealLastProtectedZip() }
+                        .buttonStyle(.link)
+                        .font(.system(size: 9))
+                }
+            }
+
+            if state.activeZipPassword.unicodeScalars.contains(where: { !$0.isASCII }) {
+                Text("Tip: ASCII characters are the most portable choice for ZIP passwords.")
+                    .font(.system(size: 9))
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let error = state.zipPasswordError {
+                Text(error)
+                    .font(.system(size: 9))
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.primary.opacity(0.05)))
     }
 
     private var syncingRow: some View {
@@ -282,7 +395,7 @@ struct PopoverView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
-                .disabled(!state.canSync || state.isSyncing)
+                .disabled(!state.canSync || state.isBusy)
             }
 
             HStack(spacing: 6) {

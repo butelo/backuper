@@ -117,23 +117,28 @@ struct AppConfiguration: Codable {
     var dailyMinute: Int
     var items: [TrackedItem]
     var lastSyncAt: Date?
+    /// Whether protected ZIPs reuse one common password. The passwords
+    /// themselves live in the Keychain, not here.
+    var useCommonPassword: Bool
 
     init(destinationPath: String = "",
          dailyEnabled: Bool = true,
          dailyHour: Int = 9,
          dailyMinute: Int = 0,
          items: [TrackedItem] = [],
-         lastSyncAt: Date? = nil) {
+         lastSyncAt: Date? = nil,
+         useCommonPassword: Bool = true) {
         self.destinationPath = destinationPath
         self.dailyEnabled = dailyEnabled
         self.dailyHour = dailyHour
         self.dailyMinute = dailyMinute
         self.items = items
         self.lastSyncAt = lastSyncAt
+        self.useCommonPassword = useCommonPassword
     }
 
     private enum CodingKeys: String, CodingKey {
-        case destinationPath, dailyEnabled, dailyHour, dailyMinute, items, lastSyncAt
+        case destinationPath, dailyEnabled, dailyHour, dailyMinute, items, lastSyncAt, useCommonPassword
     }
 
     init(from decoder: Decoder) throws {
@@ -144,6 +149,7 @@ struct AppConfiguration: Codable {
         dailyMinute = try c.decodeIfPresent(Int.self, forKey: .dailyMinute) ?? 0
         items = try c.decodeIfPresent([TrackedItem].self, forKey: .items) ?? []
         lastSyncAt = try c.decodeIfPresent(Date.self, forKey: .lastSyncAt)
+        useCommonPassword = try c.decodeIfPresent(Bool.self, forKey: .useCommonPassword) ?? true
     }
 }
 
